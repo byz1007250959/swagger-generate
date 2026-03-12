@@ -34,6 +34,7 @@
 package generator
 
 import (
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1054,13 +1055,25 @@ func (g *OpenAPIGenerator) addSchemasForEnumsToDocument(d *openapi.Document, enu
 		if !common.Contains(g.requiredEnumSchemas, schemaName) || common.Contains(g.generatedSchemas, schemaName) {
 			continue
 		}
+
+		enumValues := enumDesc.GetValues()
+		varNames := make([]string, 0, len(enumValues))
 		enumSchema := &openapi.Schema{
-			Type:   "string",
-			Format: "enum",
-			Enum:   make([]*openapi.Any, 0, len(enumDesc.GetValues())),
+			Type:   "integer",
+			Format: "int32",
+			Enum:   make([]*openapi.Any, 0, len(enumValues)),
 		}
-		for _, v := range enumDesc.GetValues() {
-			enumSchema.Enum = append(enumSchema.Enum, &openapi.Any{Yaml: v.GetName()})
+		for _, v := range enumValues {
+			enumSchema.Enum = append(enumSchema.Enum, &openapi.Any{Yaml: strconv.FormatInt(v.GetValue(), 10)})
+			varNames = append(varNames, v.GetName())
+		}
+		if len(varNames) > 0 {
+			enumSchema.SpecificationExtension = []*openapi.NamedAny{
+				{
+					Name:  "x-enum-varnames",
+					Value: &openapi.Any{Yaml: fmt.Sprintf("[%s]", strings.Join(varNames, ", "))},
+				},
+			}
 		}
 		g.addSchemaToDocument(d, &openapi.NamedSchemaOrReference{
 			Name: schemaName,
