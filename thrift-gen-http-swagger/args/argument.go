@@ -23,7 +23,9 @@ import (
 )
 
 type Arguments struct {
-	OutputDir string
+	OutputDir     string
+	EmitServer    bool
+	OperationIDBy string
 }
 
 func (a *Arguments) Unpack(args []string) error {

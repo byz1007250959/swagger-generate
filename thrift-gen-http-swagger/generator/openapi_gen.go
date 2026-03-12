@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cloudwego/hertz/cmd/hz/util/logs"
@@ -51,20 +52,36 @@ import (
 )
 
 type OpenAPIGenerator struct {
-	fileDesc         *thrift_reflection.FileDescriptor
-	ast              *parser.Thrift
-	generatedSchemas []string
-	requiredSchemas  []string
-	requiredTypeDesc []*thrift_reflection.StructDescriptor
+	fileDesc            *thrift_reflection.FileDescriptor
+	ast                 *parser.Thrift
+	args                *args.Arguments
+	generatedSchemas    []string
+	requiredSchemas     []string
+	requiredTypeDesc    []*thrift_reflection.StructDescriptor
+	requiredEnumSchemas []string
+	requiredEnumDesc    []*thrift_reflection.EnumDescriptor
+	operationIDSet      map[string]struct{}
 }
 
 // NewOpenAPIGenerator creates a new generator for a protoc plugin invocation.
-func NewOpenAPIGenerator(ast *parser.Thrift) *OpenAPIGenerator {
+func NewOpenAPIGenerator(ast *parser.Thrift, arguments *args.Arguments) *OpenAPIGenerator {
 	_, fileDesc := thrift_reflection.RegisterAST(ast)
+	if arguments == nil {
+		arguments = &args.Arguments{}
+	}
+	if arguments.OperationIDBy == "" {
+		arguments.OperationIDBy = "method"
+	}
 	return &OpenAPIGenerator{
-		fileDesc:         fileDesc,
-		ast:              ast,
-		generatedSchemas: make([]string, 0),
+		fileDesc:            fileDesc,
+		ast:                 ast,
+		args:                arguments,
+		generatedSchemas:    make([]string, 0),
+		requiredSchemas:     make([]string, 0),
+		requiredTypeDesc:    make([]*thrift_reflection.StructDescriptor, 0),
+		requiredEnumSchemas: make([]string, 0),
+		requiredEnumDesc:    make([]*thrift_reflection.EnumDescriptor, 0),
+		operationIDSet:      make(map[string]struct{}),
 	}
 }
 
@@ -105,6 +122,22 @@ func (g *OpenAPIGenerator) BuildDocument(arguments *args.Arguments) []*plugin.Ge
 		count := len(g.requiredSchemas)
 		g.addSchemasForStructsToDocument(d, g.requiredTypeDesc)
 		g.requiredSchemas = g.requiredSchemas[count:len(g.requiredSchemas)]
+		if len(g.requiredTypeDesc) > count {
+			g.requiredTypeDesc = g.requiredTypeDesc[count:len(g.requiredTypeDesc)]
+		} else {
+			g.requiredTypeDesc = nil
+		}
+	}
+
+	for len(g.requiredEnumSchemas) > 0 {
+		count := len(g.requiredEnumSchemas)
+		g.addSchemasForEnumsToDocument(d, g.requiredEnumDesc)
+		g.requiredEnumSchemas = g.requiredEnumSchemas[count:len(g.requiredEnumSchemas)]
+		if len(g.requiredEnumDesc) > count {
+			g.requiredEnumDesc = g.requiredEnumDesc[count:len(g.requiredEnumDesc)]
+		} else {
+			g.requiredEnumDesc = nil
+		}
 	}
 
 	if len(d.Tags) == 1 {
@@ -305,7 +338,7 @@ func (g *OpenAPIGenerator) addPathsToDocument(d *openapi.Document, services []*t
 						}
 
 						annotationsCount++
-						operationID := s.GetName() + "_" + m.GetName()
+						operationID := g.buildOperationID(s.GetName(), m.GetName())
 						comment := g.filterCommentString(m.Comments)
 
 						op, path2 := g.buildOperation(d, methodName, comment, operationID, s.GetName(), path[0], host, inputDesc, outputDesc, throwDesc)
@@ -332,6 +365,46 @@ func (g *OpenAPIGenerator) addPathsToDocument(d *openapi.Document, services []*t
 	}
 }
 
+func (g *OpenAPIGenerator) buildOperationID(serviceName, methodName string) string {
+	candidate := serviceName + "_" + methodName
+	if strings.EqualFold(g.args.OperationIDBy, "method") {
+		candidate = methodName
+	}
+	if _, exists := g.operationIDSet[candidate]; !exists {
+		g.operationIDSet[candidate] = struct{}{}
+		return candidate
+	}
+	fallback := serviceName + "_" + methodName
+	if _, exists := g.operationIDSet[fallback]; !exists {
+		g.operationIDSet[fallback] = struct{}{}
+		return fallback
+	}
+	for i := 2; ; i++ {
+		withSuffix := fallback + "_" + strconv.Itoa(i)
+		if _, exists := g.operationIDSet[withSuffix]; !exists {
+			g.operationIDSet[withSuffix] = struct{}{}
+			return withSuffix
+		}
+	}
+}
+
+func hasRequiredAnnotatedField(inputDesc *thrift_reflection.StructDescriptor, options ...string) bool {
+	if inputDesc == nil {
+		return false
+	}
+	for _, field := range inputDesc.GetFields() {
+		if !field.IsRequired() {
+			continue
+		}
+		for _, option := range options {
+			if ext := field.Annotations[option]; len(ext) > 0 && ext[0] != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (g *OpenAPIGenerator) buildOperation(
 	d *openapi.Document,
 	methodName string,
@@ -353,7 +426,7 @@ func (g *OpenAPIGenerator) buildOperation(
 		for _, v := range inputDesc.GetFields() {
 			var paramName, paramIn, paramDesc string
 			var fieldSchema *openapi.SchemaOrReference
-			required := false
+			required := v.IsRequired()
 
 			extOrNil := v.Annotations[consts.ApiQuery]
 			if len(extOrNil) > 0 {
@@ -531,12 +604,14 @@ func (g *OpenAPIGenerator) buildOperation(
 			}
 
 			if len(additionalProperties) > 0 {
+				requestBodyRequired := hasRequiredAnnotatedField(inputDesc, consts.ApiBody, consts.ApiForm, consts.ApiRawBody)
 				RequestBody = &openapi.RequestBodyOrReference{
 					RequestBody: &openapi.RequestBody{
 						Description: g.filterCommentString(inputDesc.Comments),
 						Content: &openapi.MediaTypes{
 							AdditionalProperties: additionalProperties,
 						},
+						Required: requestBodyRequired,
 					},
 				}
 			}
@@ -738,7 +813,7 @@ func (g *OpenAPIGenerator) getSchemaByOption(inputDesc *thrift_reflection.Struct
 				extName = field.Annotations[option][0]
 			}
 
-			if common.Contains(allRequired, extName) {
+			if field.IsRequired() || common.Contains(allRequired, extName) {
 				required = append(required, extName)
 			}
 
@@ -769,6 +844,9 @@ func (g *OpenAPIGenerator) getSchemaByOption(inputDesc *thrift_reflection.Struct
 					Value: fieldSchema,
 				},
 			)
+			if field.IsRequired() {
+				required = append(required, extName)
+			}
 		}
 	}
 
@@ -784,7 +862,21 @@ func (g *OpenAPIGenerator) getSchemaByOption(inputDesc *thrift_reflection.Struct
 		}
 	}
 
-	schema.Required = required
+	if len(required) > 0 {
+		uniq := make(map[string]struct{}, len(required))
+		dedup := make([]string, 0, len(required))
+		for _, name := range required {
+			if name == "" {
+				continue
+			}
+			if _, ok := uniq[name]; ok {
+				continue
+			}
+			uniq[name] = struct{}{}
+			dedup = append(dedup, name)
+		}
+		schema.Required = dedup
+	}
 	return schema
 }
 
@@ -863,6 +955,7 @@ func (g *OpenAPIGenerator) addSchemasForStructsToDocument(d *openapi.Document, s
 		definitionProperties := &openapi.Properties{
 			AdditionalProperties: make([]*openapi.NamedSchemaOrReference, 0),
 		}
+		required := make([]string, 0)
 
 		for _, field := range s.Fields {
 			// Get the field description from the comments.
@@ -900,6 +993,9 @@ func (g *OpenAPIGenerator) addSchemasForStructsToDocument(d *openapi.Document, s
 					Value: fieldSchema,
 				},
 			)
+			if field.IsRequired() {
+				required = append(required, extName)
+			}
 		}
 
 		schema := &openapi.Schema{
@@ -920,11 +1016,56 @@ func (g *OpenAPIGenerator) addSchemasForStructsToDocument(d *openapi.Document, s
 			}
 		}
 
+		if len(schema.Required) > 0 {
+			required = append(required, schema.Required...)
+		}
+		if len(required) > 0 {
+			uniq := make(map[string]struct{}, len(required))
+			dedup := make([]string, 0, len(required))
+			for _, name := range required {
+				if name == "" {
+					continue
+				}
+				if _, ok := uniq[name]; ok {
+					continue
+				}
+				uniq[name] = struct{}{}
+				dedup = append(dedup, name)
+			}
+			schema.Required = dedup
+		}
+
 		// Add the schema to the components.schema list.
 		g.addSchemaToDocument(d, &openapi.NamedSchemaOrReference{
 			Name: schemaName,
 			Value: &openapi.SchemaOrReference{
 				Schema: schema,
+			},
+		})
+	}
+}
+
+func (g *OpenAPIGenerator) addSchemasForEnumsToDocument(d *openapi.Document, enums []*thrift_reflection.EnumDescriptor) {
+	for _, enumDesc := range enums {
+		if enumDesc == nil {
+			continue
+		}
+		schemaName := enumDesc.GetName()
+		if !common.Contains(g.requiredEnumSchemas, schemaName) || common.Contains(g.generatedSchemas, schemaName) {
+			continue
+		}
+		enumSchema := &openapi.Schema{
+			Type:   "string",
+			Format: "enum",
+			Enum:   make([]*openapi.Any, 0, len(enumDesc.GetValues())),
+		}
+		for _, v := range enumDesc.GetValues() {
+			enumSchema.Enum = append(enumSchema.Enum, &openapi.Any{Yaml: v.GetName()})
+		}
+		g.addSchemaToDocument(d, &openapi.NamedSchemaOrReference{
+			Name: schemaName,
+			Value: &openapi.SchemaOrReference{
+				Schema: enumSchema,
 			},
 		})
 	}
@@ -980,6 +1121,15 @@ func (g *OpenAPIGenerator) schemaReferenceForMessage(message *thrift_reflection.
 	return consts.ComponentSchemaPrefix + schemaName
 }
 
+func (g *OpenAPIGenerator) schemaReferenceForEnum(enumDesc *thrift_reflection.EnumDescriptor) string {
+	schemaName := enumDesc.GetName()
+	if !common.Contains(g.requiredEnumSchemas, schemaName) {
+		g.requiredEnumSchemas = append(g.requiredEnumSchemas, schemaName)
+		g.requiredEnumDesc = append(g.requiredEnumDesc, enumDesc)
+	}
+	return consts.ComponentSchemaPrefix + schemaName
+}
+
 func (g *OpenAPIGenerator) schemaOrReferenceForField(fieldType *thrift_reflection.TypeDescriptor) *openapi.SchemaOrReference {
 	var kindSchema *openapi.SchemaOrReference
 
@@ -1031,12 +1181,9 @@ func (g *OpenAPIGenerator) schemaOrReferenceForField(fieldType *thrift_reflectio
 			logs.Errorf("Error getting enum descriptor: %s", err)
 			return nil
 		}
-		kindSchema = &openapi.SchemaOrReference{Schema: &openapi.Schema{}}
-		kindSchema.Schema.Type = "string"
-		kindSchema.Schema.Format = "enum"
-		kindSchema.Schema.Enum = make([]*openapi.Any, 0, len(enumDesc.GetValues()))
-		for _, v := range enumDesc.GetValues() {
-			kindSchema.Schema.Enum = append(kindSchema.Schema.Enum, &openapi.Any{Yaml: v.GetName()})
+		ref := g.schemaReferenceForEnum(enumDesc)
+		kindSchema = &openapi.SchemaOrReference{
+			Reference: &openapi.Reference{Xref: ref},
 		}
 
 	case fieldType.IsUnion():

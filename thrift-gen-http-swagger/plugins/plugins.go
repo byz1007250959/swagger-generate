@@ -61,20 +61,25 @@ func handleRequest(req *plugin.Request) (err error) {
 
 	ast := req.GetAST()
 
-	og := generator.NewOpenAPIGenerator(ast)
+	og := generator.NewOpenAPIGenerator(ast, args)
 	openapiContent := og.BuildDocument(args)
 
-	sg, err := generator.NewServerGenerator(ast, args)
-	if err != nil {
-		return err
-	}
-	serverContent, err := sg.Generate()
-	if err != nil {
-		return err
+	contents := make([]*plugin.Generated, 0, len(openapiContent)+1)
+	contents = append(contents, openapiContent...)
+	if args.EmitServer {
+		sg, err := generator.NewServerGenerator(ast, args)
+		if err != nil {
+			return err
+		}
+		serverContent, err := sg.Generate()
+		if err != nil {
+			return err
+		}
+		contents = append(contents, serverContent...)
 	}
 
 	res := &plugin.Response{
-		Contents: append(openapiContent, serverContent...),
+		Contents: contents,
 	}
 	if err := handleResponse(res); err != nil {
 		return err
